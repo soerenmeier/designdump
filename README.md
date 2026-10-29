@@ -14,6 +14,9 @@ figma-to-html export design.fig --screenshots shots/ --out out/
 # or pick frames by name or id
 figma-to-html export design.fig --frame "Landing page" --frame 4323:2656 --out out/
 
+# add the tablet / mobile designs (frames with the same name, smaller width)
+figma-to-html export design.fig --screenshots shots/ --responsive --out out/
+
 # debug: the resolved tree of one node as JSON
 figma-to-html dump design.fig --node 2042:1131
 ```
@@ -33,6 +36,14 @@ figma-to-html dump design.fig --node 2042:1131
 - `<frame>.css`: one rule per class. Auto layout becomes flexbox (gap,
   padding, alignment, hug / fill / fixed sizes), everything else absolute
   positioning. Bound variables are used instead of raw values.
+- Hover: instances whose component swaps to another variant on hover get
+  `:hover` rules with the difference between the variants and the
+  transition of the interaction. Clicks that navigate become `data-link`.
+- `--responsive`: frames with the same name and a smaller width (the most
+  similar one per width) become `@media` rules in the frame's CSS, where
+  every layer with a class changes the same way; layers that only exist in
+  the smaller design are listed in a comment. They are also exported on
+  their own as `<frame>-<width>.html/css`, which is the reliable version.
 - `<frame>.screenshot.*`: the screenshot that matched the frame.
 - `assets/`: images, videos and vector layers (icons, logos) as SVG.
 - `base.css`: a small reset, plus `--fonts <file>` for the preview.

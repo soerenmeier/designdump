@@ -6,7 +6,7 @@ mod kiwi;
 mod svg;
 mod vars;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +43,10 @@ enum Cmd {
 		/// CSS file with @font-face rules to include in the preview
 		#[arg(long)]
 		fonts: Option<PathBuf>,
+		/// Add media queries from frames with the same name and a smaller
+		/// width (tablet / mobile designs)
+		#[arg(short, long)]
+		responsive: bool,
 	},
 	/// Dump the decoded document (or one node) as JSON
 	Dump {
@@ -62,12 +66,14 @@ fn main() -> Result<()> {
 			screenshots,
 			out,
 			fonts,
+			responsive,
 		} => export(
 			&file,
 			&frame,
 			screenshots.as_deref(),
 			&out,
 			fonts.as_deref(),
+			responsive,
 		),
 		Cmd::Dump { file, node } => {
 			let fig = fig::FigFile::open(&file)?;
@@ -164,6 +170,10 @@ fn mode_widths(doc: &Doc) -> HashMap<Guid, f64> {
 struct Job {
 	frame: Guid,
 	screenshot: Option<PathBuf>,
+	/// file name instead of the frame name
+	slug: Option<String>,
+	/// a smaller version of another exported frame
+	related: bool,
 }
 
 fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec<Job>> {
@@ -176,6 +186,8 @@ fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec
 			jobs.push(Job {
 				frame: g,
 				screenshot: None,
+				slug: None,
+				related: false,
 			});
 			continue;
 		}
@@ -189,6 +201,8 @@ fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec
 			[g] => jobs.push(Job {
 				frame: *g,
 				screenshot: None,
+				slug: None,
+				related: false,
 			}),
 			_ => {
 				let ids: Vec<String> = matches.iter().map(|g| g.to_string()).collect();
@@ -250,10 +264,70 @@ fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec
 			None => jobs.push(Job {
 				frame: best,
 				screenshot: Some(path),
+				slug: None,
+				related: false,
 			}),
 		}
 	}
 	Ok(jobs)
+}
+
+/// Names of the layers in a subtree, for comparing frames.
+fn layer_names(doc: &Doc, g: Guid, depth: usize, out: &mut HashSet<String>) {
+	for c in doc.kids(g) {
+		out.insert(doc.name(*c).to_string());
+		if depth > 0 {
+			layer_names(doc, *c, depth - 1, out);
+		}
+	}
+}
+
+/// Frames with the same name and a smaller width, the most similar one per
+/// width, with a media query each (breakpoints halfway between widths).
+fn smaller_versions(doc: &Doc, frame: Guid) -> Vec<(Guid, String)> {
+	let width = |g: Guid| {
+		doc.node(g)
+			.and_then(|n| n.get("size"))
+			.and_then(|s| s["x"].as_f64())
+			.unwrap_or(0.0)
+	};
+	let w0 = width(frame);
+	let mut names = HashSet::new();
+	layer_names(doc, frame, 3, &mut names);
+
+	let mut best: BTreeMap<i64, (f64, Guid)> = BTreeMap::new();
+	for (_, f) in top_frames(doc) {
+		let w = width(f);
+		if f == frame || doc.name(f) != doc.name(frame) || w >= w0 - 1.0 {
+			continue;
+		}
+		let mut other = HashSet::new();
+		layer_names(doc, f, 3, &mut other);
+		let common = names.intersection(&other).count() as f64;
+		let score = common / names.union(&other).count().max(1) as f64;
+		if std::env::var_os("FIG_DEBUG").is_some() {
+			eprintln!("{f} {w} similarity {score:.2}");
+		}
+		// unrelated frames that happen to have the same name
+		if score < 0.3 {
+			continue;
+		}
+		let slot = best.entry(w.round() as i64).or_insert((-1.0, f));
+		// on a tie the newer frame
+		if score > slot.0 || (score == slot.0 && f > slot.1) {
+			*slot = (score, f);
+		}
+	}
+
+	// widest first
+	let mut out = Vec::new();
+	let mut larger = w0;
+	for (w, (_, g)) in best.into_iter().rev() {
+		let bp = ((w as f64 + larger) / 2.0).floor();
+		out.push((g, format!("(max-width: {}px)", num(bp))));
+		larger = w as f64;
+	}
+	out
 }
 
 const BASE_CSS: &str = "*, *::before, *::after {
@@ -273,11 +347,13 @@ fn export(
 	shots: Option<&Path>,
 	out: &Path,
 	fonts: Option<&Path>,
+	responsive: bool,
 ) -> Result<()> {
 	let fig = fig::FigFile::open(file)?;
 	let doc = Doc::new(&fig.message);
 	let vars = vars::Vars::new(&doc);
 	let jobs = find_frames(&doc, wanted, shots)?;
+	let jobs: Vec<Job> = jobs;
 	if jobs.is_empty() {
 		bail!("nothing to export, give --frame or --screenshots");
 	}
@@ -294,10 +370,33 @@ fn export(
 	let mut index = Vec::new();
 	let mut slugs: HashMap<String, usize> = HashMap::new();
 
+	// the smaller designs also on their own, the merged media queries are
+	// only a best effort
+	let mut jobs = jobs;
+	if responsive {
+		let mut extra = Vec::new();
+		for job in &jobs {
+			for (other, _) in smaller_versions(&doc, job.frame) {
+				let w = doc
+					.node(other)
+					.and_then(|n| n.get("size"))
+					.and_then(|s| s["x"].as_f64())
+					.unwrap_or(0.0);
+				extra.push(Job {
+					frame: other,
+					screenshot: None,
+					slug: Some(format!("{}-{}", kebab(doc.name(other)), num(w))),
+					related: true,
+				});
+			}
+		}
+		jobs.extend(extra);
+	}
+
 	for job in &jobs {
 		let node = doc.resolve(job.frame).context("frame is hidden")?;
 		let name = doc.name(job.frame).to_string();
-		let mut slug = kebab(&name);
+		let mut slug = job.slug.clone().unwrap_or_else(|| kebab(&name));
 		let n = slugs.entry(slug.clone()).or_default();
 		*n += 1;
 		if *n > 1 {
@@ -305,6 +404,21 @@ fn export(
 		}
 
 		let body = emitter.frame(&node)?;
+		let mut related = Vec::new();
+		if responsive && !job.related {
+			for (other, query) in smaller_versions(&doc, job.frame) {
+				let Some(tree) = doc.resolve(other) else {
+					continue;
+				};
+				let label = format!(
+					"\"{}\" designed at {}px ({other}), breakpoint guessed",
+					doc.name(other),
+					num(tree.size().0)
+				);
+				emitter.responsive(&node, &tree, &query, &label);
+				related.push(other.to_string());
+			}
+		}
 		let css = emitter.css();
 
 		let shot = match &job.screenshot {
@@ -338,7 +452,11 @@ fn export(
 		);
 		std::fs::write(out.join(format!("{slug}.html")), html)?;
 		std::fs::write(out.join(format!("{slug}.css")), css)?;
-		println!("{} -> {slug}.html", job.frame);
+		if related.is_empty() {
+			println!("{} -> {slug}.html", job.frame);
+		} else {
+			println!("{} (+ {}) -> {slug}.html", job.frame, related.join(", "));
+		}
 		index.push((slug, name, shot));
 	}
 

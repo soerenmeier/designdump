@@ -27,6 +27,8 @@ pub struct Emitter<'a> {
 	rules: Vec<(String, Decls)>,
 	/// class of every emitted node, by address in the current tree
 	class_of: HashMap<*const RNode, String>,
+	/// rules for the frame at other widths
+	media: Vec<Media>,
 	/// hover rules already written, to skip repeats
 	seen_rules: std::collections::HashSet<String>,
 	/// text styles used: style guid -> class
@@ -53,6 +55,7 @@ impl<'a> Emitter<'a> {
 			classes: HashMap::new(),
 			rules: Vec::new(),
 			class_of: HashMap::new(),
+			media: Vec::new(),
 			seen_rules: Default::default(),
 			text_styles: BTreeMap::new(),
 			written_assets: HashMap::new(),
@@ -65,6 +68,7 @@ impl<'a> Emitter<'a> {
 		self.classes.clear();
 		self.rules.clear();
 		self.class_of.clear();
+		self.media.clear();
 		self.seen_rules.clear();
 		let mut out = String::new();
 		self.node(n, None, 0, &mut out)?;
@@ -80,6 +84,25 @@ impl<'a> Emitter<'a> {
 			let _ = writeln!(out, "{selector} {{");
 			for (p, v) in decls {
 				let _ = writeln!(out, "\t{p}: {v};");
+			}
+			out.push_str("}\n\n");
+		}
+		for m in &self.media {
+			let _ = writeln!(out, "/* {} */", m.label);
+			if !m.only.is_empty() {
+				let _ = writeln!(
+					out,
+					"/* only in this design, not in the html: {} */",
+					m.only.join(", ")
+				);
+			}
+			let _ = writeln!(out, "@media {} {{", m.query);
+			for (selector, decls) in &m.rules {
+				let _ = writeln!(out, "\t{selector} {{");
+				for (p, v) in decls {
+					let _ = writeln!(out, "\t\t{p}: {v};");
+				}
+				out.push_str("\t}\n\n");
 			}
 			out.push_str("}\n\n");
 		}
@@ -379,18 +402,27 @@ impl<'a> Emitter<'a> {
 		};
 
 		let base = format!(".{class}");
+		let mut changes = Vec::new();
+		self.tree_diff(inst, &from, &to, None, "hover", &mut changes);
 		let mut rules: Vec<(String, Decls)> = Vec::new();
 		let mut animated: Vec<String> = Vec::new();
-		self.hover_diff(
-			inst,
-			&from,
-			&to,
-			None,
-			&base,
-			true,
-			&mut rules,
-			&mut animated,
-		);
+		for ch in changes {
+			let Some(c) = self.class_of.get(&ch.node).cloned() else {
+				continue;
+			};
+			let (selector, plain) = if std::ptr::eq(ch.node, inst) {
+				(format!("{base}:hover"), base.clone())
+			} else {
+				(format!("{base}:hover .{c}"), format!("{base} .{c}"))
+			};
+			let decls = if ch.gone {
+				vec![("opacity".into(), "0".into())]
+			} else {
+				ch.decls
+			};
+			rules.push((selector, decls));
+			animated.push(plain);
+		}
 		if rules.is_empty() {
 			return;
 		}
@@ -412,26 +444,18 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	#[allow(clippy::too_many_arguments)]
-	fn hover_diff(
+	/// Walk an emitted tree (`actual`) along two versions of it and
+	/// collect what changes from `from` to `to`, per emitted node.
+	/// Children are matched by name and position among equal names.
+	fn tree_diff(
 		&mut self,
 		actual: &RNode,
 		from: &RNode,
 		to: &RNode,
 		parents: Option<(&RNode, &RNode)>,
-		base: &str,
-		root: bool,
-		rules: &mut Vec<(String, Decls)>,
-		animated: &mut Vec<String>,
+		suffix: &str,
+		out: &mut Vec<Change>,
 	) {
-		let Some(class) = self.class_of.get(&(actual as *const RNode)).cloned() else {
-			return;
-		};
-		let (selector, plain) = if root {
-			(format!("{base}:hover"), base.to_string())
-		} else {
-			(format!("{base}:hover .{class}"), format!("{base} .{class}"))
-		};
 		let a = self.decls(from, parents.map(|p| p.0));
 		let b = self.decls(to, parents.map(|p| p.1));
 		let mut diff = Decls::new();
@@ -452,7 +476,7 @@ impl<'a> Emitter<'a> {
 			let (sa, sb) = (svg::render(self.doc, from), svg::render(self.doc, to));
 			if sa != sb
 				&& let Ok(url) = self.asset(
-					&format!("{}-hover", kebab(&to.name)),
+					&format!("{}-{suffix}", kebab(&to.name)),
 					"svg",
 					sb.as_bytes(),
 				) {
@@ -460,11 +484,13 @@ impl<'a> Emitter<'a> {
 			}
 		}
 		if !diff.is_empty() {
-			rules.push((selector.clone(), diff));
-			animated.push(plain.clone());
+			out.push(Change {
+				node: actual,
+				decls: diff,
+				gone: false,
+			});
 		}
 
-		// children, matched by name and position among equal names
 		let pick = |list: &'_ [RNode], name: &str, nth: usize| -> Option<usize> {
 			list.iter()
 				.enumerate()
@@ -477,35 +503,86 @@ impl<'a> Emitter<'a> {
 			let nth = seen.entry(c.name.as_str()).or_default();
 			let i = *nth;
 			*nth += 1;
-			let (Some(fi), ti) = (
-				pick(&from.children, &c.name, i),
-				pick(&to.children, &c.name, i),
-			) else {
+			let Some(fi) = pick(&from.children, &c.name, i) else {
 				continue;
 			};
-			match ti {
-				Some(ti) => self.hover_diff(
+			match pick(&to.children, &c.name, i) {
+				Some(ti) => self.tree_diff(
 					c,
 					&from.children[fi],
 					&to.children[ti],
 					Some((from, to)),
-					base,
-					false,
-					rules,
-					animated,
+					suffix,
+					out,
 				),
-				None => {
-					// gone in the hover state
-					if let Some(cc) = self.class_of.get(&(c as *const RNode)).cloned() {
-						rules.push((
-							format!("{base}:hover .{cc}"),
-							vec![("opacity".into(), "0".into())],
-						));
-						animated.push(format!("{base} .{cc}"));
+				None => out.push(Change {
+					node: c,
+					decls: Decls::new(),
+					gone: true,
+				}),
+			}
+		}
+	}
+
+	/// Media query rules for the same frame designed at another width.
+	/// `frame` must be the tree that was just emitted.
+	pub fn responsive(&mut self, frame: &RNode, other: &RNode, query: &str, label: &str) {
+		let mut changes = Vec::new();
+		self.tree_diff(frame, frame, other, None, label, &mut changes);
+		// a class can stand for several layers: only use a change when all
+		// of them change the same way
+		let mut uses: HashMap<String, usize> = HashMap::new();
+		for c in self.class_of.values() {
+			*uses.entry(c.clone()).or_default() += 1;
+		}
+		let mut by_class: Vec<(String, Vec<Decls>)> = Vec::new();
+		for ch in changes {
+			let Some(class) = self.class_of.get(&ch.node).cloned() else {
+				continue;
+			};
+			let mut decls = ch.decls;
+			if ch.gone {
+				decls = vec![("display".into(), "none".into())];
+			}
+			// the root keeps the width of the design, let it follow the viewport
+			if std::ptr::eq(ch.node, frame) {
+				for d in decls.iter_mut() {
+					if d.0 == "width" {
+						d.1 = "100%".into();
 					}
 				}
 			}
+			match by_class.iter_mut().find(|(c, _)| *c == class) {
+				Some((_, list)) => list.push(decls),
+				None => by_class.push((class, vec![decls])),
+			}
 		}
+		let mut rules: Vec<(String, Decls)> = Vec::new();
+		let mut skipped = 0;
+		for (class, list) in by_class {
+			let same = list.iter().all(|d| *d == list[0]);
+			if !same || list.len() != uses.get(&class).copied().unwrap_or(0) {
+				skipped += 1;
+				continue;
+			}
+			rules.push((format!(".{class}"), list.into_iter().next().unwrap()));
+		}
+		let label = if skipped > 0 {
+			format!(
+				"{label}; {skipped} classes differ between their layers and are left out"
+			)
+		} else {
+			label.to_string()
+		};
+		// layers that only exist at this width
+		let mut only = Vec::new();
+		collect_new(frame, other, "", &mut only);
+		self.media.push(Media {
+			query: query.to_string(),
+			label,
+			rules,
+			only,
+		});
 	}
 
 	fn mode_attrs(&self, n: &RNode) -> String {
@@ -1312,6 +1389,39 @@ impl<'a> Emitter<'a> {
 		let ext = sniff(data);
 		let data = data.clone();
 		self.asset(if name.is_empty() { &hash } else { &name }, ext, &data)
+	}
+}
+
+struct Change {
+	node: *const RNode,
+	decls: Decls,
+	/// the layer does not exist in the other version
+	gone: bool,
+}
+
+struct Media {
+	query: String,
+	label: String,
+	rules: Vec<(String, Decls)>,
+	only: Vec<String>,
+}
+
+/// Paths of layers in `other` that have no match in `frame`.
+fn collect_new(frame: &RNode, other: &RNode, path: &str, out: &mut Vec<String>) {
+	let mut seen: HashMap<&str, usize> = HashMap::new();
+	for c in &other.children {
+		let nth = seen.entry(c.name.as_str()).or_default();
+		let i = *nth;
+		*nth += 1;
+		let p = if path.is_empty() {
+			c.name.clone()
+		} else {
+			format!("{path} > {}", c.name)
+		};
+		match frame.children.iter().filter(|f| f.name == c.name).nth(i) {
+			Some(f) => collect_new(f, c, &p, out),
+			None => out.push(p),
+		}
 	}
 }
 
