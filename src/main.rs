@@ -34,10 +34,11 @@ enum Cmd {
 		/// Frame name or id (e.g. "Landing page" or 2042:1131), repeatable
 		#[arg(short, long)]
 		frame: Vec<String>,
-		/// Directory with screenshots named after frames; exports every
-		/// frame that has one
+		/// Directory with screenshots named after frames (searched
+		/// recursively, repeatable); without --frame every frame that has
+		/// one is exported
 		#[arg(short, long)]
-		screenshots: Option<PathBuf>,
+		screenshots: Vec<PathBuf>,
 		/// Output directory
 		#[arg(short, long, default_value = "out")]
 		out: PathBuf,
@@ -76,7 +77,7 @@ fn main() -> Result<()> {
 		} => export(
 			&file,
 			&frame,
-			screenshots.as_deref(),
+			&screenshots,
 			&out,
 			fonts.as_deref(),
 			responsive,
@@ -183,7 +184,11 @@ struct Job {
 	related: bool,
 }
 
-fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec<Job>> {
+fn find_frames(
+	doc: &Doc,
+	wanted: &[String],
+	dirs: &[PathBuf],
+) -> Result<(Vec<Job>, HashMap<Guid, PathBuf>)> {
 	let frames = top_frames(doc);
 	let mut jobs = Vec::new();
 	for w in wanted {
@@ -222,61 +227,96 @@ fn find_frames(doc: &Doc, wanted: &[String], shots: Option<&Path>) -> Result<Vec
 		}
 	}
 
-	let Some(dir) = shots else { return Ok(jobs) };
-	let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?
-		.filter_map(|e| e.ok().map(|e| e.path()))
-		.filter(|p| {
-			matches!(
-				p.extension()
-					.and_then(|e| e.to_str())
-					.map(str::to_ascii_lowercase)
-					.as_deref(),
-				Some("png" | "jpg" | "jpeg" | "webp")
-			)
-		})
-		.collect();
-	entries.sort();
-	for path in entries {
-		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-		let candidates: Vec<Guid> = frames
-			.iter()
-			.filter(|(_, f)| doc.name(*f) == stem)
-			.map(|(_, f)| *f)
-			.collect();
-		if candidates.is_empty() {
-			eprintln!("no frame for screenshot {}", path.display());
-			continue;
-		}
-		// several frames with the same name: take the one whose aspect
-		// ratio matches the screenshot
-		let dim = imagesize::size(&path).ok();
-		let best = candidates
-			.iter()
-			.min_by(|a, b| {
-				let score = |g: &Guid| {
-					let size = doc.node(*g).and_then(|n| n.get("size"));
-					let w = size.and_then(|s| s["x"].as_f64()).unwrap_or(1.0);
-					let h = size.and_then(|s| s["y"].as_f64()).unwrap_or(1.0);
-					match dim {
-						Some(d) => ((d.height as f64 / d.width as f64) - h / w).abs(),
-						None => 0.0,
-					}
-				};
-				score(a).total_cmp(&score(b))
-			})
-			.copied()
-			.unwrap();
-		match jobs.iter_mut().find(|j| j.frame == best) {
-			Some(j) => j.screenshot = Some(path),
-			None => jobs.push(Job {
-				frame: best,
-				screenshot: Some(path),
+	let shots = match_screenshots(doc, dirs)?;
+	if jobs.is_empty() {
+		let mut ids: Vec<Guid> = shots.keys().copied().collect();
+		ids.sort();
+		jobs = ids
+			.into_iter()
+			.map(|g| Job {
+				frame: g,
+				screenshot: None,
 				slug: None,
 				related: false,
-			}),
+			})
+			.collect();
+	}
+	for j in &mut jobs {
+		j.screenshot = shots.get(&j.frame).cloned();
+	}
+	Ok((jobs, shots))
+}
+
+fn image_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+	for e in std::fs::read_dir(dir)? {
+		let p = e?.path();
+		if p.is_dir() {
+			image_files(&p, out)?;
+		} else if matches!(
+			p.extension()
+				.and_then(|e| e.to_str())
+				.map(str::to_ascii_lowercase)
+				.as_deref(),
+			Some("png" | "jpg" | "jpeg" | "webp")
+		) {
+			out.push(p);
 		}
 	}
-	Ok(jobs)
+	Ok(())
+}
+
+/// Match screenshots to frames: by name (Figma adds "-1", "-2" to
+/// exports of frames with the same name) and by size, each frame once.
+fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBuf>> {
+	let frames = top_frames(doc);
+	let mut files = Vec::new();
+	for d in dirs {
+		image_files(d, &mut files)?;
+	}
+	files.sort();
+
+	// (score, frame, file), lower is better
+	let mut options: Vec<(f64, Guid, usize)> = Vec::new();
+	for (i, path) in files.iter().enumerate() {
+		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+		let base = match stem.rsplit_once('-') {
+			Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => b,
+			_ => stem,
+		};
+		let Ok(dim) = imagesize::size(path) else {
+			continue;
+		};
+		for (_, f) in &frames {
+			let name = doc.name(*f);
+			if name != stem && name != base {
+				continue;
+			}
+			let size = doc.node(*f).and_then(|n| n.get("size"));
+			let w = size.and_then(|s| s["x"].as_f64()).unwrap_or(1.0);
+			let h = size.and_then(|s| s["y"].as_f64()).unwrap_or(1.0);
+			// exports are at 1x, 2x, ...
+			let scale = (dim.width as f64 / w).round().max(1.0);
+			let score = (dim.width as f64 / scale - w).abs() / w
+				+ (dim.height as f64 / scale - h).abs() / h;
+			if score < 0.1 {
+				options.push((score, *f, i));
+			}
+		}
+		if !options.iter().any(|o| o.2 == i) {
+			eprintln!("no frame for screenshot {}", path.display());
+		}
+	}
+	options.sort_by(|a, b| a.0.total_cmp(&b.0));
+	let mut out = HashMap::new();
+	let mut used = HashSet::new();
+	for (_, f, i) in options {
+		if out.contains_key(&f) || used.contains(&i) {
+			continue;
+		}
+		used.insert(i);
+		out.insert(f, files[i].clone());
+	}
+	Ok(out)
 }
 
 /// Names of the layers in a subtree, for comparing frames.
@@ -291,7 +331,12 @@ fn layer_names(doc: &Doc, g: Guid, depth: usize, out: &mut HashSet<String>) {
 
 /// Frames with the same name and a smaller width, the most similar one per
 /// width, with a media query each (breakpoints halfway between widths).
-fn smaller_versions(doc: &Doc, frame: Guid) -> Vec<(Guid, String)> {
+/// Frames with a screenshot win over frames without one.
+fn smaller_versions(
+	doc: &Doc,
+	frame: Guid,
+	shots: &HashMap<Guid, PathBuf>,
+) -> Vec<(Guid, String)> {
 	let width = |g: Guid| {
 		doc.node(g)
 			.and_then(|n| n.get("size"))
@@ -302,7 +347,7 @@ fn smaller_versions(doc: &Doc, frame: Guid) -> Vec<(Guid, String)> {
 	let mut names = HashSet::new();
 	layer_names(doc, frame, 3, &mut names);
 
-	let mut best: BTreeMap<i64, (f64, Guid)> = BTreeMap::new();
+	let mut best: BTreeMap<i64, (bool, f64, Guid)> = BTreeMap::new();
 	for (_, f) in top_frames(doc) {
 		let w = width(f);
 		if f == frame || doc.name(f) != doc.name(frame) || w >= w0 - 1.0 {
@@ -319,17 +364,18 @@ fn smaller_versions(doc: &Doc, frame: Guid) -> Vec<(Guid, String)> {
 		if score < 0.3 {
 			continue;
 		}
-		let slot = best.entry(w.round() as i64).or_insert((-1.0, f));
-		// on a tie the newer frame
-		if score > slot.0 || (score == slot.0 && f > slot.1) {
-			*slot = (score, f);
+		let shot = shots.contains_key(&f);
+		let slot = best.entry(w.round() as i64).or_insert((shot, -1.0, f));
+		// a screenshot first, then similarity, on a tie the newer frame
+		if (shot, score, f) > *slot {
+			*slot = (shot, score, f);
 		}
 	}
 
 	// widest first
 	let mut out = Vec::new();
 	let mut larger = w0;
-	for (w, (_, g)) in best.into_iter().rev() {
+	for (w, (_, _, g)) in best.into_iter().rev() {
 		let bp = ((w as f64 + larger) / 2.0).floor();
 		out.push((g, format!("(max-width: {}px)", num(bp))));
 		larger = w as f64;
@@ -351,7 +397,7 @@ img {
 fn export(
 	file: &Path,
 	wanted: &[String],
-	shots: Option<&Path>,
+	shot_dirs: &[PathBuf],
 	out: &Path,
 	fonts: Option<&Path>,
 	responsive: bool,
@@ -360,8 +406,16 @@ fn export(
 	let fig = fig::FigFile::open(file)?;
 	let doc = Doc::new(&fig.message);
 	let vars = vars::Vars::new(&doc);
-	let jobs = find_frames(&doc, wanted, shots)?;
-	let jobs: Vec<Job> = jobs;
+	let (mut jobs, shots) = find_frames(&doc, wanted, shot_dirs)?;
+	if responsive {
+		// smaller versions of another frame come with that frame
+		let related: HashSet<Guid> = jobs
+			.iter()
+			.flat_map(|j| smaller_versions(&doc, j.frame, &shots))
+			.map(|(g, _)| g)
+			.collect();
+		jobs.retain(|j| !related.contains(&j.frame));
+	}
 	if jobs.is_empty() {
 		bail!("nothing to export, give --frame or --screenshots");
 	}
@@ -380,11 +434,10 @@ fn export(
 
 	// the smaller designs also on their own, the merged media queries are
 	// only a best effort
-	let mut jobs = jobs;
 	if responsive {
 		let mut extra = Vec::new();
 		for job in &jobs {
-			for (other, _) in smaller_versions(&doc, job.frame) {
+			for (other, _) in smaller_versions(&doc, job.frame, &shots) {
 				let w = doc
 					.node(other)
 					.and_then(|n| n.get("size"))
@@ -392,7 +445,7 @@ fn export(
 					.unwrap_or(0.0);
 				extra.push(Job {
 					frame: other,
-					screenshot: None,
+					screenshot: shots.get(&other).cloned(),
 					slug: Some(format!("{}-{}", kebab(doc.name(other)), num(w))),
 					related: true,
 				});
@@ -414,7 +467,7 @@ fn export(
 		let body = emitter.frame(&node)?;
 		let mut related = Vec::new();
 		if responsive && !job.related {
-			for (other, query) in smaller_versions(&doc, job.frame) {
+			for (other, query) in smaller_versions(&doc, job.frame, &shots) {
 				let Some(tree) = doc.resolve(other) else {
 					continue;
 				};
