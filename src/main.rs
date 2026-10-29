@@ -3,6 +3,7 @@ mod doc;
 mod fig;
 mod html;
 mod kiwi;
+mod map;
 mod svg;
 mod vars;
 
@@ -47,6 +48,10 @@ enum Cmd {
 		/// width (tablet / mobile designs)
 		#[arg(short, long)]
 		responsive: bool,
+		/// Project directory: map the Figma tokens to its CSS variables and
+		/// SCSS mixins (written at the top of tokens.css)
+		#[arg(short, long)]
+		project: Option<PathBuf>,
 	},
 	/// Dump the decoded document (or one node) as JSON
 	Dump {
@@ -67,6 +72,7 @@ fn main() -> Result<()> {
 			out,
 			fonts,
 			responsive,
+			project,
 		} => export(
 			&file,
 			&frame,
@@ -74,6 +80,7 @@ fn main() -> Result<()> {
 			&out,
 			fonts.as_deref(),
 			responsive,
+			project.as_deref(),
 		),
 		Cmd::Dump { file, node } => {
 			let fig = fig::FigFile::open(&file)?;
@@ -348,6 +355,7 @@ fn export(
 	out: &Path,
 	fonts: Option<&Path>,
 	responsive: bool,
+	project: Option<&Path>,
 ) -> Result<()> {
 	let fig = fig::FigFile::open(file)?;
 	let doc = Doc::new(&fig.message);
@@ -463,7 +471,17 @@ fn export(
 	// text styles first, they use variables too
 	let styles = emitter.text_styles_css();
 	let mut tokens = String::from("/* Design tokens from Figma variables */\n\n");
-	tokens.push_str(&vars.tokens_css(&mode_widths(&doc)));
+	let token_css = vars.tokens_css(&mode_widths(&doc));
+	if let Some(dir) = project {
+		let p = map::Project::load(dir)?;
+		let styles: Vec<(String, String)> = emitter
+			.text_styles
+			.iter()
+			.map(|(g, class)| (class.clone(), doc.name(*g).to_string()))
+			.collect();
+		tokens.push_str(&map::mapping(&vars, &styles, &p));
+	}
+	tokens.push_str(&token_css);
 	tokens.push_str("\n/* Text styles */\n\n");
 	tokens.push_str(&styles);
 	std::fs::write(out.join("tokens.css"), tokens)?;

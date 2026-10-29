@@ -160,6 +160,25 @@ impl Vars {
 		None
 	}
 
+	/// The value of every mode of a variable, aliases resolved.
+	pub fn mode_values(&self, id: Guid) -> Vec<&Value> {
+		let Some(v) = self.vars.get(&id) else {
+			return Vec::new();
+		};
+		v.values
+			.iter()
+			.filter_map(|(_, data)| match Self::alias_of(data) {
+				Some(a) => self.resolve(a),
+				None => data.get("value"),
+			})
+			.collect()
+	}
+
+	/// Variables referenced so far.
+	pub fn used(&self) -> Vec<Guid> {
+		self.used.borrow().iter().copied().collect()
+	}
+
 	pub fn resolve_string(&self, id: Guid) -> Option<String> {
 		self.resolve(id)?
 			.get("textValue")

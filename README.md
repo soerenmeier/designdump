@@ -44,6 +44,10 @@ figma-to-html dump design.fig --node 2042:1131
   every layer with a class changes the same way; layers that only exist in
   the smaller design are listed in a comment. They are also exported on
   their own as `<frame>-<width>.html/css`, which is the reliable version.
+- `--project <dir>`: maps the Figma tokens to the CSS variables and SCSS
+  mixins the project already has (same name, same color, same font, same
+  name and size), as a comment at the top of `tokens.css`, with a list of
+  tokens that have no match.
 - `<frame>.screenshot.*`: the screenshot that matched the frame.
 - `assets/`: images, videos and vector layers (icons, logos) as SVG.
 - `base.css`: a small reset, plus `--fonts <file>` for the preview.
