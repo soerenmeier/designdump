@@ -23,8 +23,12 @@ pub struct Emitter<'a> {
 	pub assets_url: String,
 	/// class name -> rule bodies that use it (index = suffix)
 	classes: HashMap<String, Vec<Decls>>,
-	/// rules in document order
+	/// rules in document order: (selector, declarations)
 	rules: Vec<(String, Decls)>,
+	/// class of every emitted node, by address in the current tree
+	class_of: HashMap<*const RNode, String>,
+	/// hover rules already written, to skip repeats
+	seen_rules: std::collections::HashSet<String>,
 	/// text styles used: style guid -> class
 	pub text_styles: BTreeMap<Guid, String>,
 	written_assets: HashMap<String, String>,
@@ -48,6 +52,8 @@ impl<'a> Emitter<'a> {
 			assets_url: assets_url.to_string(),
 			classes: HashMap::new(),
 			rules: Vec::new(),
+			class_of: HashMap::new(),
+			seen_rules: Default::default(),
 			text_styles: BTreeMap::new(),
 			written_assets: HashMap::new(),
 		}
@@ -58,6 +64,8 @@ impl<'a> Emitter<'a> {
 	pub fn frame(&mut self, n: &RNode) -> Result<String> {
 		self.classes.clear();
 		self.rules.clear();
+		self.class_of.clear();
+		self.seen_rules.clear();
 		let mut out = String::new();
 		self.node(n, None, 0, &mut out)?;
 		Ok(out)
@@ -65,11 +73,11 @@ impl<'a> Emitter<'a> {
 
 	pub fn css(&self) -> String {
 		let mut out = String::new();
-		for (class, decls) in &self.rules {
+		for (selector, decls) in &self.rules {
 			if decls.is_empty() {
 				continue;
 			}
-			let _ = writeln!(out, ".{class} {{");
+			let _ = writeln!(out, "{selector} {{");
 			for (p, v) in decls {
 				let _ = writeln!(out, "\t{p}: {v};");
 			}
@@ -131,7 +139,7 @@ impl<'a> Emitter<'a> {
 				} else {
 					format!("{base}-{}", i + 1)
 				};
-				self.rules.push((class, decls.clone()));
+				self.rules.push((format!(".{class}"), decls.clone()));
 				i
 			}
 		};
@@ -142,6 +150,69 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
+	/// What a node becomes in HTML.
+	fn kind(&self, n: &RNode) -> Kind {
+		if svg::is_graphic(n) {
+			return Kind::Graphic;
+		}
+		if matches!(
+			n.ty.as_str(),
+			"RECTANGLE" | "ROUNDED_RECTANGLE" | "ELLIPSE" | "FRAME" | "INSTANCE"
+		) && n.children.is_empty()
+			&& let Some(img) = svg::paints(n, "fillPaints")
+				.last()
+				.filter(|p| p["type"] == "IMAGE" || p["type"] == "VIDEO")
+				.cloned()
+		{
+			return if img["type"] == "VIDEO" {
+				Kind::Video(img)
+			} else {
+				Kind::Image(img)
+			};
+		}
+		if n.ty == "TEXT" {
+			return Kind::Text;
+		}
+		Kind::Box
+	}
+
+	/// All declarations of a node.
+	fn decls(&mut self, n: &RNode, parent: Option<&RNode>) -> Decls {
+		let mut decls = Decls::new();
+		self.layout_decls(n, parent, &mut decls);
+		match self.kind(n) {
+			Kind::Graphic => {
+				self.effect_decls(n, &mut decls);
+				push_opacity(n, &mut decls);
+			}
+			Kind::Video(_) => {
+				push(&mut decls, "object-fit", "cover");
+				self.box_decls(n, &mut decls, true);
+			}
+			Kind::Image(img) => {
+				let fit = match img.get("imageScaleMode").and_then(Value::as_str) {
+					Some("FIT") => "contain",
+					Some("STRETCH") => "fill",
+					_ => "cover",
+				};
+				push(&mut decls, "object-fit", fit);
+				self.box_decls(n, &mut decls, true);
+			}
+			Kind::Text => {
+				self.text_decls(n, &mut decls);
+				push_opacity(n, &mut decls);
+				self.effect_decls(n, &mut decls);
+			}
+			Kind::Box => {
+				self.box_decls(n, &mut decls, false);
+				if n.children.iter().any(|c| !in_flow(c, n)) {
+					push(&mut decls, "position", "relative");
+				}
+			}
+		}
+		decls
+	}
+
 	fn node(
 		&mut self,
 		n: &RNode,
@@ -150,8 +221,7 @@ impl<'a> Emitter<'a> {
 		out: &mut String,
 	) -> Result<()> {
 		let pad = "\t".repeat(depth);
-		let mut decls = Decls::new();
-		self.layout_decls(n, parent, &mut decls);
+		let decls = self.decls(n, parent);
 
 		let mut attrs = String::new();
 		if let Some(info) = &n.instance {
@@ -168,105 +238,274 @@ impl<'a> Emitter<'a> {
 				let _ = write!(attrs, " data-props=\"{}\"", escape(&props.join("; ")));
 			}
 		}
+		attrs.push_str(&self.link_attrs(n));
 		if parent.is_none() {
 			attrs.push_str(&self.mode_attrs(n));
 		}
 
-		// vectors
-		if svg::is_graphic(n) {
-			let svg = svg::render(self.doc, n);
-			let file = self.asset(&kebab(&n.name), "svg", svg.as_bytes())?;
-			self.effect_decls(n, &mut decls);
-			push_opacity(n, &mut decls);
-			let class = self.class_for(&n.name, &decls);
-			let _ = writeln!(
-				out,
-				"{pad}<img class=\"{class}\" src=\"{file}\" alt=\"\"{attrs}>"
-			);
-			return Ok(());
-		}
-
-		// images
-		if matches!(
-			n.ty.as_str(),
-			"RECTANGLE" | "ROUNDED_RECTANGLE" | "ELLIPSE" | "FRAME" | "INSTANCE"
-		) && n.children.is_empty()
-			&& let Some(img) = svg::paints(n, "fillPaints")
-				.last()
-				.filter(|p| p["type"] == "IMAGE" || p["type"] == "VIDEO")
-				.cloned()
-		{
-			let src = self.image_asset(&img)?;
-			if img["type"] == "VIDEO" {
+		match self.kind(n) {
+			Kind::Graphic => {
+				let svg = svg::render(self.doc, n);
+				let file = self.asset(&kebab(&n.name), "svg", svg.as_bytes())?;
+				let class = self.class_for(&n.name, &decls);
+				let _ = writeln!(
+					out,
+					"{pad}<img class=\"{class}\" src=\"{file}\" alt=\"\"{attrs}>"
+				);
+				self.class_of.insert(n, class);
+			}
+			Kind::Video(img) => {
+				let src = self.image_asset(&img)?;
 				let video = self.video_asset(&img)?;
-				push(&mut decls, "object-fit", "cover");
-				self.box_decls(n, &mut decls, true);
 				let class = self.class_for(&n.name, &decls);
 				let _ = writeln!(
 					out,
 					"{pad}<video class=\"{class}\" src=\"{video}\" poster=\"{src}\" autoplay muted loop playsinline{attrs}></video>"
 				);
-				return Ok(());
+				self.class_of.insert(n, class);
 			}
-			let fit = match img.get("imageScaleMode").and_then(Value::as_str) {
-				Some("FIT") => "contain",
-				Some("STRETCH") => "fill",
-				_ => "cover",
-			};
-			push(&mut decls, "object-fit", fit);
-			self.box_decls(n, &mut decls, true);
-			let class = self.class_for(&n.name, &decls);
-			let _ = writeln!(
-				out,
-				"{pad}<img class=\"{class}\" src=\"{src}\" alt=\"{}\"{attrs}>",
-				escape(&n.name)
-			);
-			return Ok(());
+			Kind::Image(img) => {
+				let src = self.image_asset(&img)?;
+				let class = self.class_for(&n.name, &decls);
+				let _ = writeln!(
+					out,
+					"{pad}<img class=\"{class}\" src=\"{src}\" alt=\"{}\"{attrs}>",
+					escape(&n.name)
+				);
+				self.class_of.insert(n, class);
+			}
+			Kind::Text => {
+				let (tag, style_class) = self.text_tag(n);
+				// text layers are often named after their content
+				let auto =
+					n.get("autoRename")
+						.and_then(Value::as_bool)
+						.unwrap_or(false) || n.name.chars().count() > 32;
+				let name = match (auto, parent) {
+					(true, Some(p)) => format!("{} text", p.name),
+					(true, None) => "text".into(),
+					(false, _) => n.name.clone(),
+				};
+				let class = self.class_for(&name, &decls);
+				let all = match style_class {
+					Some(s) => format!("{class} {s}"),
+					None => class.clone(),
+				};
+				let content = self.text_content(n);
+				let _ =
+					writeln!(out, "{pad}<{tag} class=\"{all}\"{attrs}>{content}</{tag}>");
+				self.class_of.insert(n, class);
+			}
+			Kind::Box => {
+				let class = self.class_for(&n.name, &decls);
+				self.class_of.insert(n, class.clone());
+				if n.children.is_empty() {
+					let _ = writeln!(out, "{pad}<div class=\"{class}\"{attrs}></div>");
+				} else {
+					let _ = writeln!(out, "{pad}<div class=\"{class}\"{attrs}>");
+					for c in &n.children {
+						self.node(c, Some(n), depth + 1, out)?;
+					}
+					let _ = writeln!(out, "{pad}</div>");
+				}
+			}
 		}
 
-		if n.ty == "TEXT" {
-			let (tag, extra_class) = self.text_decls(n, &mut decls);
-			push_opacity(n, &mut decls);
-			self.effect_decls(n, &mut decls);
-			// text layers are often named after their content
-			let auto = n
-				.get("autoRename")
-				.and_then(Value::as_bool)
-				.unwrap_or(false)
-				|| n.name.chars().count() > 32;
-			let name = match (auto, parent) {
-				(true, Some(p)) => format!("{} text", p.name),
-				(true, None) => "text".into(),
-				(false, _) => n.name.clone(),
-			};
-			let class = self.class_for(&name, &decls);
-			let class = match extra_class {
-				Some(s) => format!("{class} {s}"),
-				None => class,
-			};
-			let content = self.text_content(n);
-			let _ = writeln!(
-				out,
-				"{pad}<{tag} class=\"{class}\"{attrs}>{content}</{tag}>"
-			);
-			return Ok(());
+		if n.instance.is_some() {
+			self.hover_rules(n);
 		}
-
-		self.box_decls(n, &mut decls, false);
-		if n.children.iter().any(|c| !in_flow(c, n)) {
-			push(&mut decls, "position", "relative");
-		}
-		let class = self.class_for(&n.name, &decls);
-		if n.children.is_empty() {
-			let _ = writeln!(out, "{pad}<div class=\"{class}\"{attrs}></div>");
-			return Ok(());
-		}
-		let _ = writeln!(out, "{pad}<div class=\"{class}\"{attrs}>");
-		for c in &n.children {
-			self.node(c, Some(n), depth + 1, out)?;
-		}
-		let _ = writeln!(out, "{pad}</div>");
 		Ok(())
+	}
+
+	/// Prototype links: clicks that navigate to or scroll to a frame.
+	fn link_attrs(&self, n: &RNode) -> String {
+		let mut s = String::new();
+		for (event, action) in interactions(n) {
+			if event != "ON_CLICK" {
+				continue;
+			}
+			let Some(target) = action.get("transitionNodeID").and_then(Guid::from_value)
+			else {
+				continue;
+			};
+			if self.doc.node(target).is_none() {
+				continue;
+			}
+			let attr = match action.get("navigationType").and_then(Value::as_str) {
+				Some("NAVIGATE") => "data-link",
+				Some("SCROLL_TO") => "data-scroll-to",
+				Some("OVERLAY") => "data-overlay",
+				_ => continue,
+			};
+			let _ = write!(s, " {attr}=\"{}\"", escape(self.doc.name(target)));
+		}
+		s
+	}
+
+	/// `:hover` rules for an instance whose component swaps to another
+	/// variant on hover: the difference between the two variants.
+	fn hover_rules(&mut self, inst: &RNode) {
+		let Some((target, action)) = interactions(inst).find_map(|(event, action)| {
+			if event != "ON_HOVER"
+				|| action.get("navigationType").and_then(Value::as_str)
+					!= Some("SWAP_STATE")
+			{
+				return None;
+			}
+			let t = action.get("transitionNodeID").and_then(Guid::from_value)?;
+			Some((t, action.clone()))
+		}) else {
+			return;
+		};
+		let source = inst
+			.get("overriddenSymbolID")
+			.and_then(Guid::from_value)
+			.or_else(|| {
+				inst.get("symbolData")?
+					.get("symbolID")
+					.and_then(Guid::from_value)
+			});
+		let (Some(source), Some(class)) =
+			(source, self.class_of.get(&(inst as *const RNode)).cloned())
+		else {
+			return;
+		};
+		if self.doc.ty(target) != "SYMBOL" || target == source {
+			return;
+		}
+		let (Some(from), Some(to)) = (self.doc.resolve(source), self.doc.resolve(target))
+		else {
+			return;
+		};
+
+		let base = format!(".{class}");
+		let mut rules: Vec<(String, Decls)> = Vec::new();
+		let mut animated: Vec<String> = Vec::new();
+		self.hover_diff(
+			inst,
+			&from,
+			&to,
+			None,
+			&base,
+			true,
+			&mut rules,
+			&mut animated,
+		);
+		if rules.is_empty() {
+			return;
+		}
+
+		// the transition of the interaction on everything that changes
+		if let Some(t) = transition(&action) {
+			animated.dedup();
+			let key = format!("{}|{t}", animated.join(","));
+			if self.seen_rules.insert(key) {
+				self.rules
+					.push((animated.join(",\n"), vec![("transition".into(), t)]));
+			}
+		}
+		for (selector, decls) in rules {
+			let key = format!("{selector}|{decls:?}");
+			if self.seen_rules.insert(key) {
+				self.rules.push((selector, decls));
+			}
+		}
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn hover_diff(
+		&mut self,
+		actual: &RNode,
+		from: &RNode,
+		to: &RNode,
+		parents: Option<(&RNode, &RNode)>,
+		base: &str,
+		root: bool,
+		rules: &mut Vec<(String, Decls)>,
+		animated: &mut Vec<String>,
+	) {
+		let Some(class) = self.class_of.get(&(actual as *const RNode)).cloned() else {
+			return;
+		};
+		let (selector, plain) = if root {
+			(format!("{base}:hover"), base.to_string())
+		} else {
+			(format!("{base}:hover .{class}"), format!("{base} .{class}"))
+		};
+		let a = self.decls(from, parents.map(|p| p.0));
+		let b = self.decls(to, parents.map(|p| p.1));
+		let mut diff = Decls::new();
+		for (k, v) in &b {
+			if a.iter().find(|(ka, _)| ka == k).map(|(_, va)| va) != Some(v) {
+				push(&mut diff, k, v.clone());
+			}
+		}
+		for (k, _) in &a {
+			if !b.iter().any(|(kb, _)| kb == k) {
+				push(&mut diff, k, "unset");
+			}
+		}
+		// vectors that are drawn differently swap their image
+		if matches!(self.kind(from), Kind::Graphic)
+			&& matches!(self.kind(to), Kind::Graphic)
+		{
+			let (sa, sb) = (svg::render(self.doc, from), svg::render(self.doc, to));
+			if sa != sb
+				&& let Ok(url) = self.asset(
+					&format!("{}-hover", kebab(&to.name)),
+					"svg",
+					sb.as_bytes(),
+				) {
+				push(&mut diff, "content", format!("url(\"{url}\")"));
+			}
+		}
+		if !diff.is_empty() {
+			rules.push((selector.clone(), diff));
+			animated.push(plain.clone());
+		}
+
+		// children, matched by name and position among equal names
+		let pick = |list: &'_ [RNode], name: &str, nth: usize| -> Option<usize> {
+			list.iter()
+				.enumerate()
+				.filter(|(_, c)| c.name == name)
+				.nth(nth)
+				.map(|(i, _)| i)
+		};
+		let mut seen: HashMap<&str, usize> = HashMap::new();
+		for c in &actual.children {
+			let nth = seen.entry(c.name.as_str()).or_default();
+			let i = *nth;
+			*nth += 1;
+			let (Some(fi), ti) = (
+				pick(&from.children, &c.name, i),
+				pick(&to.children, &c.name, i),
+			) else {
+				continue;
+			};
+			match ti {
+				Some(ti) => self.hover_diff(
+					c,
+					&from.children[fi],
+					&to.children[ti],
+					Some((from, to)),
+					base,
+					false,
+					rules,
+					animated,
+				),
+				None => {
+					// gone in the hover state
+					if let Some(cc) = self.class_of.get(&(c as *const RNode)).cloned() {
+						rules.push((
+							format!("{base}:hover .{cc}"),
+							vec![("opacity".into(), "0".into())],
+						));
+						animated.push(format!("{base} .{cc}"));
+					}
+				}
+			}
+		}
 	}
 
 	fn mode_attrs(&self, n: &RNode) -> String {
@@ -436,6 +675,18 @@ impl<'a> Emitter<'a> {
 				push(d, "transform-origin", "0 0");
 				push(d, "rotate", format!("{}deg", num(angle)));
 			}
+		}
+
+		// Figma paints later layers on top, css paints positioned elements
+		// above the flow: lift flow children that follow an absolute one
+		if flow
+			&& let Some(p) = parent
+			&& p.children
+				.iter()
+				.take_while(|c| !std::ptr::eq(*c, n))
+				.any(|c| !in_flow(c, p))
+		{
+			push(d, "position", "relative");
 		}
 
 		// sizes
@@ -877,6 +1128,12 @@ impl<'a> Emitter<'a> {
 		d
 	}
 
+	/// The tag of a text node and the class of its text style.
+	fn text_tag(&mut self, n: &RNode) -> (String, Option<String>) {
+		let mut d = Decls::new();
+		self.text_decls(n, &mut d)
+	}
+
 	/// Text declarations; returns the tag and the text style class.
 	fn text_decls(&mut self, n: &RNode, d: &mut Decls) -> (String, Option<String>) {
 		let style = n
@@ -1056,6 +1313,73 @@ impl<'a> Emitter<'a> {
 		let data = data.clone();
 		self.asset(if name.is_empty() { &hash } else { &name }, ext, &data)
 	}
+}
+
+enum Kind {
+	Graphic,
+	Image(Value),
+	Video(Value),
+	Text,
+	Box,
+}
+
+/// (event, action) of the prototype interactions of a node.
+fn interactions(n: &RNode) -> impl Iterator<Item = (&str, &Value)> {
+	n.get("prototypeInteractions")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter(|i| i.get("isDeleted").and_then(Value::as_bool) != Some(true))
+		.flat_map(|i| {
+			let event = i
+				.pointer("/event/interactionType")
+				.and_then(Value::as_str)
+				.unwrap_or("");
+			i.get("actions")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.map(move |a| (event, a))
+		})
+}
+
+/// CSS transition for a prototype action.
+fn transition(action: &Value) -> Option<String> {
+	let ty = action.get("transitionType").and_then(Value::as_str)?;
+	if ty == "INSTANT_TRANSITION" {
+		return None;
+	}
+	let secs = action.get("transitionDuration").and_then(Value::as_f64)?;
+	let easing = match action.get("easingType").and_then(Value::as_str) {
+		Some("LINEAR") => "linear".to_string(),
+		Some("EASE_IN") => "ease-in".to_string(),
+		Some("EASE_OUT") => "ease-out".to_string(),
+		Some("EASE_IN_AND_OUT") => "ease-in-out".to_string(),
+		Some("IN_CUBIC") => "cubic-bezier(0.32, 0, 0.67, 0)".to_string(),
+		Some("OUT_CUBIC") => "cubic-bezier(0.33, 1, 0.68, 1)".to_string(),
+		Some("INOUT_CUBIC") => "cubic-bezier(0.65, 0, 0.35, 1)".to_string(),
+		Some("EASE_IN_BACK") => "cubic-bezier(0.36, 0, 0.66, -0.56)".to_string(),
+		Some("EASE_OUT_BACK") => "cubic-bezier(0.34, 1.56, 0.64, 1)".to_string(),
+		Some("CUSTOM_CUBIC_BEZIER") => {
+			let f: Vec<String> = action
+				.get("easingFunction")
+				.and_then(Value::as_array)
+				.into_iter()
+				.flatten()
+				.filter_map(Value::as_f64)
+				.map(num)
+				.collect();
+			if f.len() == 4 {
+				format!("cubic-bezier({})", f.join(", "))
+			} else {
+				"ease".to_string()
+			}
+		}
+		// springs have no css equivalent
+		Some(other) => format!("ease-out /* Figma {} */", other.to_ascii_lowercase()),
+		None => "ease".to_string(),
+	};
+	Some(format!("all {}s {easing}", num(secs)))
 }
 
 fn push_blend(n: &RNode, d: &mut Decls) {
