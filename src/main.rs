@@ -350,11 +350,29 @@ fn export(
 	tokens.push_str(&styles);
 	std::fs::write(out.join("tokens.css"), tokens)?;
 
-	let mut base = BASE_CSS.to_string();
-	if let Some(f) = fonts {
-		base.push('\n');
-		base.push_str(&std::fs::read_to_string(f)?);
+	let mut list = String::new();
+	for (slug, name, shot) in &index {
+		let _ = write!(list, "<li><a href=\"{slug}.html\">{}</a>", escape(name));
+		if let Some(shot) = shot {
+			let _ = write!(list, " (<a href=\"{shot}\">screenshot</a>)");
+		}
+		list.push_str("</li>\n");
 	}
+	std::fs::write(
+		out.join("index.html"),
+		format!(
+			"<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>Frames</title>\n</head>\n\
+			 <body style=\"font-family: sans-serif; padding: 2em\">\n<ul>\n{list}</ul>\n</body>\n</html>\n"
+		),
+	)?;
+
+	// fonts first, they may start with @import
+	let mut base = String::new();
+	if let Some(f) = fonts {
+		base.push_str(&std::fs::read_to_string(f)?);
+		base.push('\n');
+	}
+	base.push_str(BASE_CSS);
 	std::fs::write(out.join("base.css"), base)?;
 	Ok(())
 }
