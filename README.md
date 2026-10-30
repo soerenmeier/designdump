@@ -52,6 +52,11 @@ figma-to-html dump design.fig --node 2042:1131
   mixins the project already has (same name, same color, same font, same
   name and size), as a comment at the top of `tokens.css`, with a list of
   tokens that have no match.
+- At the top of `<frame>.html` / `.css`: the page grid (side padding of the
+  frame's full-width sections and the content width, most common first)
+  and designer notes. A note is a text layer on the frame taken out of its
+  auto layout (absolute); it becomes `<!-- designer note: … -->` instead of
+  page text.
 - `<frame>.screenshot.*`: the screenshot that matched the frame.
 - `assets/`: images, videos and vector layers (icons, logos) as SVG.
 - `base.css`: a small reset, plus `--fonts <file>` for the preview.

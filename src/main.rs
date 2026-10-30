@@ -1,6 +1,7 @@
 mod css;
 mod doc;
 mod fig;
+mod grid;
 mod html;
 mod kiwi;
 mod map;
@@ -488,7 +489,7 @@ fn export(
 				related.push(other.to_string());
 			}
 		}
-		let css = emitter.css();
+		let css = grid::comment(&node, "/*", "*/") + &emitter.css();
 
 		let shot = match &job.screenshot {
 			Some(p) => {
@@ -508,8 +509,9 @@ fn export(
 			"<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n<title>{title}</title>\n\
 			 <link rel=\"stylesheet\" href=\"base.css\">\n<link rel=\"stylesheet\" href=\"tokens.css\">\n\
 			 <link rel=\"stylesheet\" href=\"{slug}.css\">\n</head>\n<body>\n\
-			 <!-- Figma frame \"{title}\" ({id}) on page \"{page}\", {w} x {h}px{shot} -->\n{body}</body>\n</html>\n",
+			 <!-- Figma frame \"{title}\" ({id}) on page \"{page}\", {w} x {h}px{shot} -->\n{facts}{body}</body>\n</html>\n",
 			title = escape(&name),
+			facts = grid::comment(&node, "<!--", "-->"),
 			id = job.frame,
 			page = escape(page),
 			w = num(w),

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::css::{Decls, color, escape, kebab, num, push, px};
 use crate::doc::{Doc, Guid, RNode};
+use crate::grid;
 use crate::svg;
 use crate::vars::Vars;
 
@@ -244,6 +245,12 @@ impl<'a> Emitter<'a> {
 		out: &mut String,
 	) -> Result<()> {
 		let pad = "\t".repeat(depth);
+		// notes for the developers, listed at the top of the file too
+		if grid::is_note(n, parent, depth) {
+			let text = grid::note_text(n).replace("--", "-");
+			let _ = writeln!(out, "{pad}<!-- designer note: {text} -->");
+			return Ok(());
+		}
 		let decls = self.decls(n, parent);
 
 		let mut attrs = String::new();
