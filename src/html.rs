@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde_json::Value;
 
+use crate::components::Use;
 use crate::css::{Decls, color, escape, kebab, num, push, px};
 use crate::doc::{Doc, Guid, RNode};
 use crate::grid;
@@ -35,6 +36,14 @@ pub struct Emitter<'a> {
 	/// text styles used: style guid -> class
 	pub text_styles: BTreeMap<Guid, String>,
 	written_assets: HashMap<String, String>,
+	/// the frame being emitted, for `uses`: (slug, width)
+	pub frame_label: (String, f64),
+	/// every instance emitted, with the declarations of its layers
+	pub uses: Vec<Use>,
+	/// open instances: (index in `uses`, depth of the instance)
+	inst_stack: Vec<(usize, usize)>,
+	/// layer names from the frame down to the current node
+	names: Vec<String>,
 }
 
 impl<'a> Emitter<'a> {
@@ -60,6 +69,10 @@ impl<'a> Emitter<'a> {
 			seen_rules: Default::default(),
 			text_styles: BTreeMap::new(),
 			written_assets: HashMap::new(),
+			frame_label: (String::new(), 0.0),
+			uses: Vec::new(),
+			inst_stack: Vec::new(),
+			names: Vec::new(),
 		}
 	}
 
@@ -253,6 +266,43 @@ impl<'a> Emitter<'a> {
 		}
 		let decls = self.decls(n, parent);
 
+		// what the layers of instances look like, for components.md
+		self.names.truncate(depth);
+		// siblings with the same name get their position: `Photo[2]`
+		let same = parent
+			.map(|p| p.children.iter().filter(|c| c.name == n.name).count())
+			.unwrap_or(1);
+		if same > 1 {
+			let i = parent
+				.map(|p| {
+					p.children
+						.iter()
+						.filter(|c| c.name == n.name)
+						.position(|c| std::ptr::eq(c, n))
+						.unwrap_or(0)
+				})
+				.unwrap_or(0);
+			self.names.push(format!("{}[{}]", n.name, i + 1));
+		} else {
+			self.names.push(n.name.clone());
+		}
+		if let Some(info) = &n.instance {
+			self.uses.push(Use {
+				component: info.component.clone(),
+				variant: info.variant.clone(),
+				frame: self.frame_label.0.clone(),
+				width: self.frame_label.1,
+				layers: Vec::new(),
+			});
+			self.inst_stack.push((self.uses.len() - 1, depth));
+		}
+		let mut recorded = None;
+		if let Some(&(i, d0)) = self.inst_stack.last() {
+			let path = self.names[d0 + 1..].join("/");
+			self.uses[i].layers.push((path, decls.clone()));
+			recorded = Some((i, self.uses[i].layers.len() - 1));
+		}
+
 		let mut attrs = String::new();
 		if let Some(info) = &n.instance {
 			let _ = write!(attrs, " data-component=\"{}\"", escape(&info.component));
@@ -306,6 +356,11 @@ impl<'a> Emitter<'a> {
 			}
 			Kind::Text => {
 				let (tag, style_class) = self.text_tag(n);
+				if let (Some((i, l)), Some(sc)) = (recorded, &style_class) {
+					self.uses[i].layers[l]
+						.1
+						.push(("text style".into(), sc.clone()));
+				}
 				// text layers are often named after their content
 				let auto =
 					n.get("autoRename")
@@ -343,6 +398,7 @@ impl<'a> Emitter<'a> {
 
 		if n.instance.is_some() {
 			self.hover_rules(n);
+			self.inst_stack.pop();
 		}
 		Ok(())
 	}

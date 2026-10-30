@@ -1,3 +1,4 @@
+mod components;
 mod css;
 mod doc;
 mod fig;
@@ -473,6 +474,7 @@ fn export(
 			slug = format!("{slug}-{n}");
 		}
 
+		emitter.frame_label = (slug.clone(), node.size().0);
 		let body = emitter.frame(&node)?;
 		let mut related = Vec::new();
 		if responsive && !job.related {
@@ -548,6 +550,10 @@ fn export(
 	tokens.push_str("\n/* Text styles */\n\n");
 	tokens.push_str(&styles);
 	std::fs::write(out.join("tokens.css"), tokens)?;
+	std::fs::write(
+		out.join("components.md"),
+		components::markdown(&emitter.uses),
+	)?;
 
 	let mut list = String::new();
 	for (slug, name, shot) in &index {
