@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::css::{escape, kebab, num};
 use crate::doc::{Doc, Guid};
@@ -278,7 +279,14 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 	// (score, frame, file), lower is better
 	let mut options: Vec<(f64, Guid, usize)> = Vec::new();
 	for (i, path) in files.iter().enumerate() {
-		let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+		// macOS writes file names decomposed (NFD), Figma names are NFC
+		let stem: String = path
+			.file_stem()
+			.and_then(|s| s.to_str())
+			.unwrap_or("")
+			.nfc()
+			.collect();
+		let stem = stem.as_str();
 		let base = match stem.rsplit_once('-') {
 			Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => b,
 			_ => stem,
@@ -287,7 +295,7 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 			continue;
 		};
 		for (_, f) in &frames {
-			let name = doc.name(*f);
+			let name: String = doc.name(*f).nfc().collect();
 			if name != stem && name != base {
 				continue;
 			}
