@@ -62,6 +62,10 @@ figma-to-html dump design.fig --node 2042:1131
   usually a ratio, not a fixed size) and the values that differ between
   uses of the same variant (often a mistake in the design that needs a
   decision, e.g. a bullet orange in some frames and blue in others).
+- `texts.md`: the texts across all frames: texts with inline formatting
+  (a styled run like an accent colored second line, links, list items),
+  which need rich text, and texts that repeat on several pages (UI text
+  and global data, or entries shown in several places).
 - `<frame>.screenshot.*`: the screenshot that matched the frame.
 - `assets/`: images, videos and vector layers (icons, logos) as SVG.
 - `base.css`: a small reset, plus `--fonts <file>` for the preview.

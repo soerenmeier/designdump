@@ -7,6 +7,7 @@ mod html;
 mod kiwi;
 mod map;
 mod svg;
+mod texts;
 mod vars;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -554,6 +555,7 @@ fn export(
 		out.join("components.md"),
 		components::markdown(&emitter.uses),
 	)?;
+	std::fs::write(out.join("texts.md"), texts::markdown(&emitter.texts))?;
 
 	let mut list = String::new();
 	for (slug, name, shot) in &index {

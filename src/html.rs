@@ -13,6 +13,7 @@ use crate::css::{Decls, color, escape, kebab, num, push, px};
 use crate::doc::{Doc, Guid, RNode};
 use crate::grid;
 use crate::svg;
+use crate::texts::TextUse;
 use crate::vars::Vars;
 
 pub struct Emitter<'a> {
@@ -40,6 +41,8 @@ pub struct Emitter<'a> {
 	pub frame_label: (String, f64),
 	/// every instance emitted, with the declarations of its layers
 	pub uses: Vec<Use>,
+	/// every text layer emitted, for texts.md
+	pub texts: Vec<TextUse>,
 	/// open instances: (index in `uses`, depth of the instance)
 	inst_stack: Vec<(usize, usize)>,
 	/// layer names from the frame down to the current node
@@ -71,6 +74,7 @@ impl<'a> Emitter<'a> {
 			written_assets: HashMap::new(),
 			frame_label: (String::new(), 0.0),
 			uses: Vec::new(),
+			texts: Vec::new(),
 			inst_stack: Vec::new(),
 			names: Vec::new(),
 		}
@@ -377,6 +381,21 @@ impl<'a> Emitter<'a> {
 					None => class.clone(),
 				};
 				let content = self.text_content(n);
+				let component = self
+					.inst_stack
+					.last()
+					.map(|&(i, _)| self.uses[i].component.clone());
+				self.texts.push(TextUse {
+					frame: self.frame_label.0.clone(),
+					path: self.names[1..].join(" › "),
+					component,
+					text: n
+						.get("textData")
+						.and_then(|t| t["characters"].as_str())
+						.unwrap_or("")
+						.to_string(),
+					html: content.clone(),
+				});
 				let _ =
 					writeln!(out, "{pad}<{tag} class=\"{all}\"{attrs}>{content}</{tag}>");
 				self.class_of.insert(n, class);
