@@ -281,6 +281,8 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 
 	// (score, frame, file), lower is better
 	let mut options: Vec<(f64, Guid, usize)> = Vec::new();
+	// per file: its name and size, for the second pass
+	let mut info: Vec<Option<(String, String, imagesize::ImageSize)>> = Vec::new();
 	for (i, path) in files.iter().enumerate() {
 		// macOS writes file names decomposed (NFD), Figma names are NFC
 		let stem: String = path
@@ -295,8 +297,10 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 			_ => stem,
 		};
 		let Ok(dim) = imagesize::size(path) else {
+			info.push(None);
 			continue;
 		};
+		info.push(Some((stem.to_string(), base.to_string(), dim)));
 		for (_, f) in &frames {
 			let name: String = doc.name(*f).nfc().collect();
 			if name != stem && name != base {
@@ -313,9 +317,6 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 				options.push((score, *f, i));
 			}
 		}
-		if !options.iter().any(|o| o.2 == i) {
-			eprintln!("no frame for screenshot {}", path.display());
-		}
 	}
 	options.sort_by(|a, b| a.0.total_cmp(&b.0));
 	let mut out = HashMap::new();
@@ -327,7 +328,81 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 		used.insert(i);
 		out.insert(f, files[i].clone());
 	}
+
+	// Second pass: screenshots larger than their frame, exported with the
+	// content outside it (an overlay that scrolls, a row that runs past
+	// the edge). By name, among frames that fit into the image, the one on
+	// the page the other screenshots of the same folder matched wins.
+	let page_of: HashMap<Guid, Guid> = frames.iter().map(|(p, f)| (*f, *p)).collect();
+	let mut folder_pages: HashMap<PathBuf, HashMap<Guid, usize>> = HashMap::new();
+	for (f, path) in &out {
+		let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+		*folder_pages
+			.entry(dir)
+			.or_default()
+			.entry(page_of[f])
+			.or_default() += 1;
+	}
+	for (i, path) in files.iter().enumerate() {
+		if used.contains(&i) {
+			continue;
+		}
+		let Some((stem, base, dim)) = &info[i] else {
+			continue;
+		};
+		let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+		let pages = folder_pages.get(&dir);
+		let mut best: Option<(usize, f64, Guid)> = None;
+		for (page, f) in &frames {
+			let name: String = doc.name(*f).nfc().collect();
+			if (&name != stem && &name != base) || out.contains_key(f) {
+				continue;
+			}
+			let (w, h) = doc
+				.node(*f)
+				.map(|n| {
+					let s = n.get("size");
+					(
+						s.and_then(|s| s["x"].as_f64()).unwrap_or(1.0),
+						s.and_then(|s| s["y"].as_f64()).unwrap_or(1.0),
+					)
+				})
+				.unwrap_or((1.0, 1.0));
+			if (dim.width as f64) < w - 0.5 || (dim.height as f64) < h - 0.5 {
+				continue;
+			}
+			let on_page = pages.and_then(|p| p.get(page)).copied().unwrap_or(0);
+			let rank = (on_page, -(dim.width as f64 - w).abs(), *f);
+			if best.is_none_or(|b| (rank.0, rank.1) > (b.0, b.1)) {
+				best = Some(rank);
+			}
+		}
+		match best {
+			Some((_, _, f)) => {
+				eprintln!(
+					"screenshot {} is larger than frame {f}: content outside the frame",
+					path.display()
+				);
+				used.insert(i);
+				out.insert(f, path.clone());
+			}
+			None => eprintln!("no frame for screenshot {}", path.display()),
+		}
+	}
 	Ok(out)
+}
+
+/// The width class of a screenshot from its folder (`desktop/`,
+/// `tablet/`, `mobile/`), for frames of the same width: 3, 2, 1.
+fn size_class(path: &Path) -> Option<u8> {
+	path.components().rev().skip(1).find_map(|c| {
+		match c.as_os_str().to_str()?.to_ascii_lowercase().as_str() {
+			"desktop" => Some(3),
+			"tablet" => Some(2),
+			"mobile" | "phone" => Some(1),
+			_ => None,
+		}
+	})
 }
 
 /// Names of the layers in a subtree, for comparing frames.
@@ -361,7 +436,17 @@ fn smaller_versions(
 	let mut best: BTreeMap<i64, (bool, f64, Guid)> = BTreeMap::new();
 	for (_, f) in top_frames(doc) {
 		let w = width(f);
-		if f == frame || doc.name(f) != doc.name(frame) || w >= w0 - 1.0 {
+		// a frame of the same width is smaller when its screenshot sits in a
+		// smaller folder (desktop and tablet designs both at 855px)
+		let same = (w - w0).abs() < 1.0
+			&& match (
+				shots.get(&frame).and_then(|p| size_class(p)),
+				shots.get(&f).and_then(|p| size_class(p)),
+			) {
+				(Some(a), Some(b)) => b < a,
+				_ => false,
+			};
+		if f == frame || doc.name(f) != doc.name(frame) || (w >= w0 - 1.0 && !same) {
 			continue;
 		}
 		let mut other = HashSet::new();
@@ -383,10 +468,15 @@ fn smaller_versions(
 		}
 	}
 
-	// widest first
+	// widest first; a frame of the same width gets no media query (it is
+	// exported on its own only)
 	let mut out = Vec::new();
 	let mut larger = w0;
 	for (w, (_, _, g)) in best.into_iter().rev() {
+		if (w as f64 - w0).abs() < 1.0 {
+			out.push((g, String::new()));
+			continue;
+		}
 		let bp = ((w as f64 + larger) / 2.0).floor();
 		out.push((g, format!("(max-width: {}px)", num(bp))));
 		larger = w as f64;
@@ -448,16 +538,25 @@ fn export(
 	if responsive {
 		let mut extra = Vec::new();
 		for job in &jobs {
-			for (other, _) in smaller_versions(&doc, job.frame, &shots) {
+			for (other, query) in smaller_versions(&doc, job.frame, &shots) {
 				let w = doc
 					.node(other)
 					.and_then(|n| n.get("size"))
 					.and_then(|s| s["x"].as_f64())
 					.unwrap_or(0.0);
+				// the same width: named after its folder (`-tablet`)
+				let suffix = match (
+					query.is_empty(),
+					shots.get(&other).and_then(|p| size_class(p)),
+				) {
+					(true, Some(2)) => "tablet".to_string(),
+					(true, Some(1)) => "mobile".to_string(),
+					_ => num(w),
+				};
 				extra.push(Job {
 					frame: other,
 					screenshot: shots.get(&other).cloned(),
-					slug: Some(format!("{}-{}", kebab(doc.name(other)), num(w))),
+					slug: Some(format!("{}-{suffix}", kebab(doc.name(other)))),
 					related: true,
 				});
 			}
@@ -480,7 +579,9 @@ fn export(
 		let mut related = Vec::new();
 		if responsive && !job.related {
 			for (other, query) in smaller_versions(&doc, job.frame, &shots) {
-				let Some(tree) = doc.resolve(other) else {
+				// the same width can't be a media query
+				let Some(tree) = doc.resolve(other).filter(|_| !query.is_empty()) else {
+					related.push(other.to_string());
 					continue;
 				};
 				let label = format!(

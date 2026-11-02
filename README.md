@@ -19,7 +19,9 @@ figma-to-html export design.fig --screenshots shots/ --responsive --out out/
 
 # screenshots: one or more folders, searched recursively (desktop/, tablet/,
 # mobile/); "Name-1.png", Figma's name for a second frame "Name", is matched
-# by size
+# by size. The folder names also tell frames of the same width apart (a
+# tablet design at the desktop's 855px), and a screenshot larger than its
+# frame (exported with the content outside it) is matched by name
 
 # debug: the resolved tree of one node as JSON
 figma-to-html dump design.fig --node 2042:1131
