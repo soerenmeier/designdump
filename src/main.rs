@@ -22,7 +22,10 @@ use crate::css::{escape, kebab, num};
 use crate::doc::{Doc, Guid};
 
 #[derive(Parser)]
-#[command(about = "Turn Figma .fig files into HTML and CSS that AI agents can read")]
+#[command(
+	about = "Turn Figma .fig files into HTML and CSS that AI agents can read",
+	version
+)]
 struct Args {
 	#[command(subcommand)]
 	cmd: Cmd,
