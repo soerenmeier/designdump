@@ -2,6 +2,12 @@
 name = "designdump"
 version = "0.1.0"
 edition = "2024"
+description = "Turns design files saved from Figma (.fig) into HTML, CSS and design tokens that AI agents and developers can read"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/soerenmeier/designdump"
+readme = "README.md"
+keywords = ["figma", "design", "html", "css", "ai"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
 
 [dependencies]
 anyhow = "1.0.104"
