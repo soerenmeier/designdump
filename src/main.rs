@@ -23,7 +23,7 @@ use crate::doc::{Doc, Guid};
 
 #[derive(Parser)]
 #[command(
-	about = "Turn Figma .fig files into HTML and CSS that AI agents can read",
+	about = "Turn design files saved from Figma (.fig) into HTML and CSS that AI agents can read",
 	version
 )]
 struct Args {

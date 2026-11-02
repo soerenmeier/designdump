@@ -1,21 +1,30 @@
-# figma-to-html
+# designdump
 
-Reads Figma `.fig` files directly (no API, no plugin) and turns frames into
-HTML + CSS that AI agents can read to build components, and that a browser
-can render as a preview.
+Reads design files saved from Figma (`.fig`, File → Save local copy)
+directly, without the Figma API or a plugin, and turns frames into HTML +
+CSS that AI agents can read to build components, and that a browser can
+render as a preview.
+
+An unofficial tool, not affiliated with, endorsed by or sponsored by
+Figma, Inc. It reads your own files; the format is undocumented and may
+change with new Figma versions.
+
+```sh
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --git ssh://git@github.com/soerenmeier/designdump.git
+```
 
 ```sh
 # pages and top level frames
-figma-to-html list design.fig
+designdump list design.fig
 
 # export frames that have a screenshot (named after the frame) in shots/
-figma-to-html export design.fig --screenshots shots/ --out out/
+designdump export design.fig --screenshots shots/ --out out/
 
 # or pick frames by name or id
-figma-to-html export design.fig --frame "Landing page" --frame 4323:2656 --out out/
+designdump export design.fig --frame "Landing page" --frame 4323:2656 --out out/
 
 # add the tablet / mobile designs (frames with the same name, smaller width)
-figma-to-html export design.fig --screenshots shots/ --responsive --out out/
+designdump export design.fig --screenshots shots/ --responsive --out out/
 
 # screenshots: one or more folders, searched recursively (desktop/, tablet/,
 # mobile/); "Name-1.png", Figma's name for a second frame "Name", is matched
@@ -24,7 +33,7 @@ figma-to-html export design.fig --screenshots shots/ --responsive --out out/
 # frame (exported with the content outside it) is matched by name
 
 # debug: the resolved tree of one node as JSON
-figma-to-html dump design.fig --node 2042:1131
+designdump dump design.fig --node 2042:1131
 ```
 
 ## Output
