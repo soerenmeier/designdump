@@ -1,7 +1,7 @@
 //! Turns a resolved node tree into HTML with one class per node and a CSS
 //! file. Auto layout becomes flexbox, bound variables become `var(--…)`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +43,10 @@ pub struct Emitter<'a> {
 	pub uses: Vec<Use>,
 	/// every text layer emitted, for texts.md
 	pub texts: Vec<TextUse>,
+	/// decorative textures of the current frame, for its header
+	pub textures: Vec<String>,
+	/// the texture layers, so their tiles aren't textures of their own
+	texture_nodes: HashSet<*const RNode>,
 	/// open instances: (index in `uses`, depth of the instance)
 	inst_stack: Vec<(usize, usize)>,
 	/// layer names from the frame down to the current node
@@ -75,6 +79,8 @@ impl<'a> Emitter<'a> {
 			frame_label: (String::new(), 0.0),
 			uses: Vec::new(),
 			texts: Vec::new(),
+			textures: Vec::new(),
+			texture_nodes: HashSet::new(),
 			inst_stack: Vec::new(),
 			names: Vec::new(),
 		}
@@ -88,6 +94,8 @@ impl<'a> Emitter<'a> {
 		self.class_of.clear();
 		self.media.clear();
 		self.seen_rules.clear();
+		self.textures.clear();
+		self.texture_nodes.clear();
 		let mut out = String::new();
 		self.node(n, None, 0, &mut out)?;
 		Ok(out)
@@ -221,6 +229,7 @@ impl<'a> Emitter<'a> {
 	fn decls(&mut self, n: &RNode, parent: Option<&RNode>) -> Decls {
 		let mut decls = Decls::new();
 		self.layout_decls(n, parent, &mut decls);
+
 		match self.kind(n) {
 			Kind::Graphic => {
 				self.effect_decls(n, &mut decls);
@@ -327,6 +336,12 @@ impl<'a> Emitter<'a> {
 			attrs.push_str(&self.mode_attrs(n));
 		}
 
+		if let Some(note) = self.texture(n, parent)? {
+			let _ = writeln!(out, "{pad}<!-- texture: {note} -->");
+			attrs.push_str(" data-texture");
+			self.textures.push(format!("{}: {note}", n.name));
+		}
+
 		match self.kind(n) {
 			Kind::Graphic => {
 				let svg = svg::render(self.doc, n);
@@ -420,6 +435,85 @@ impl<'a> Emitter<'a> {
 			self.inst_stack.pop();
 		}
 		Ok(())
+	}
+
+	/// A decorative texture over the page instead of content: a group whose
+	/// children are all the same image (tiles), or a single image, that
+	/// spans (almost) the whole frame width and is blended (blend mode or
+	/// opacity), like a paper or noise texture. Returns the description for
+	/// the agent.
+	fn texture(&mut self, n: &RNode, parent: Option<&RNode>) -> Result<Option<String>> {
+		let frame_w = self.frame_label.1;
+		if parent.is_none_or(|p| self.texture_nodes.contains(&(p as *const RNode)))
+			|| frame_w <= 0.0
+			|| n.size().0 < frame_w * 0.9
+		{
+			return Ok(None);
+		}
+		let blended = |n: &RNode| {
+			n.s("blendMode")
+				.is_some_and(|m| !matches!(m, "NORMAL" | "PASS_THROUGH"))
+		};
+		let faded = |n: &RNode| n.f("opacity").is_some_and(|o| o < 0.999);
+		let image_of = |this: &Self, n: &RNode| match this.kind(n) {
+			Kind::Image(img) => Some(img),
+			_ => None,
+		};
+		let (tiles, paint) = if n.children.is_empty() {
+			// a single image needs a blend mode: a faded photo is content
+			match image_of(self, n) {
+				Some(img) if blended(n) => (vec![n], img),
+				_ => return Ok(None),
+			}
+		} else {
+			let imgs: Vec<_> = n.children.iter().map(|c| image_of(self, c)).collect();
+			let Some(Some(first)) = imgs.first().cloned() else {
+				return Ok(None);
+			};
+			let hash = |p: &Value| p.pointer("/image/hash").cloned();
+			if imgs
+				.iter()
+				.any(|i| i.as_ref().map(hash) != Some(hash(&first)))
+			{
+				return Ok(None);
+			}
+			if !(blended(n)
+				|| faded(n) || n.children.iter().any(|c| blended(c) || faded(c)))
+			{
+				return Ok(None);
+			}
+			(n.children.iter().collect(), first)
+		};
+		self.texture_nodes.insert(n);
+		let url = self.image_asset(&paint)?;
+		let (w, h) = tiles[0].size();
+		let mode = tiles
+			.iter()
+			.copied()
+			.chain([n])
+			.find_map(|t| {
+				t.s("blendMode")
+					.filter(|m| !matches!(*m, "NORMAL" | "PASS_THROUGH"))
+			})
+			.map(|m| format!(", blend {}", m.to_ascii_lowercase().replace('_', "-")))
+			.unwrap_or_default();
+		let opacity = n
+			.f("opacity")
+			.filter(|o| *o < 0.999)
+			.map(|o| format!(", opacity {}", num(o)))
+			.unwrap_or_default();
+		let repeat = match (tiles.len(), n.s("stackMode")) {
+			(1, _) => String::new(),
+			(k, Some("VERTICAL")) => format!(" repeated {k}x down"),
+			(k, Some("HORIZONTAL")) => format!(" repeated {k}x across"),
+			(k, _) => format!(" {k}x"),
+		};
+		Ok(Some(format!(
+			"{url} ({}x{}){repeat} over the frame{mode}{opacity}: a decorative background texture, \
+			 not content; usually one background on the page (the image repeated, with this blend mode)",
+			num(w),
+			num(h)
+		)))
 	}
 
 	/// Prototype links: clicks that navigate to or scroll to a frame.

@@ -6,6 +6,7 @@ mod grid;
 mod html;
 mod kiwi;
 mod map;
+mod shots;
 mod svg;
 mod texts;
 mod vars;
@@ -16,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::css::{escape, kebab, num};
 use crate::doc::{Doc, Guid};
@@ -276,36 +276,35 @@ fn image_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 /// exports of frames with the same name) and by size, each frame once.
 fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBuf>> {
 	let frames = top_frames(doc);
-	let mut files = Vec::new();
+	// the name Figma's export gives each frame (folders for "/")
+	let export_names: HashMap<Guid, String> = frames
+		.iter()
+		.map(|(_, f)| (*f, shots::export_name(doc.name(*f))))
+		.collect();
+	// (screenshots folder, file)
+	let mut found = Vec::new();
 	for d in dirs {
-		image_files(d, &mut files)?;
+		let mut list = Vec::new();
+		image_files(d, &mut list)?;
+		found.extend(list.into_iter().map(|p| (d.clone(), p)));
 	}
-	files.sort();
+	found.sort_by(|a, b| a.1.cmp(&b.1));
+	let files: Vec<PathBuf> = found.iter().map(|(_, p)| p.clone()).collect();
 
 	// (score, frame, file), lower is better
 	let mut options: Vec<(f64, Guid, usize)> = Vec::new();
 	// per file: its name and size, for the second pass
 	let mut info: Vec<Option<(String, String, imagesize::ImageSize)>> = Vec::new();
 	for (i, path) in files.iter().enumerate() {
-		// macOS writes file names decomposed (NFD), Figma names are NFC
-		let stem: String = path
-			.file_stem()
-			.and_then(|s| s.to_str())
-			.unwrap_or("")
-			.nfc()
-			.collect();
-		let stem = stem.as_str();
-		let base = match stem.rsplit_once('-') {
-			Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => b,
-			_ => stem,
-		};
+		let (stem, base) = shots::shot_names(&found[i].0, path);
+		let (stem, base) = (stem.as_str(), base.as_str());
 		let Ok(dim) = imagesize::size(path) else {
 			info.push(None);
 			continue;
 		};
 		info.push(Some((stem.to_string(), base.to_string(), dim)));
 		for (_, f) in &frames {
-			let name: String = doc.name(*f).nfc().collect();
+			let name = &export_names[f];
 			if name != stem && name != base {
 				continue;
 			}
@@ -357,8 +356,8 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 		let pages = folder_pages.get(&dir);
 		let mut best: Option<(usize, f64, Guid)> = None;
 		for (page, f) in &frames {
-			let name: String = doc.name(*f).nfc().collect();
-			if (&name != stem && &name != base) || out.contains_key(f) {
+			let name = &export_names[f];
+			if (name != stem && name != base) || out.contains_key(f) {
 				continue;
 			}
 			let (w, h) = doc
@@ -393,6 +392,19 @@ fn match_screenshots(doc: &Doc, dirs: &[PathBuf]) -> Result<HashMap<Guid, PathBu
 		}
 	}
 	Ok(out)
+}
+
+/// The textures of a frame as a comment block for the top of its files.
+fn textures(list: &[String], open: &str, close: &str) -> String {
+	if list.is_empty() {
+		return String::new();
+	}
+	let mut s = format!("{open} Textures (decorative, not content):\n");
+	for t in list {
+		let _ = writeln!(s, "   - {}", t.replace("--", "-"));
+	}
+	let _ = writeln!(s, "   {close}");
+	s
 }
 
 /// The width class of a screenshot from its folder (`desktop/`,
@@ -596,7 +608,9 @@ fn export(
 				related.push(other.to_string());
 			}
 		}
-		let css = grid::comment(&node, "/*", "*/") + &emitter.css();
+		let css = grid::comment(&node, "/*", "*/")
+			+ &textures(&emitter.textures, "/*", "*/")
+			+ &emitter.css();
 
 		let shot = match &job.screenshot {
 			Some(p) => {
@@ -618,7 +632,8 @@ fn export(
 			 <link rel=\"stylesheet\" href=\"{slug}.css\">\n</head>\n<body>\n\
 			 <!-- Figma frame \"{title}\" ({id}) on page \"{page}\", {w} x {h}px{shot} -->\n{facts}{body}</body>\n</html>\n",
 			title = escape(&name),
-			facts = grid::comment(&node, "<!--", "-->"),
+			facts = grid::comment(&node, "<!--", "-->")
+				+ &textures(&emitter.textures, "<!--", "-->"),
 			id = job.frame,
 			page = escape(page),
 			w = num(w),

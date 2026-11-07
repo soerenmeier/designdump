@@ -42,7 +42,9 @@ ignores your SSH setup). Update with the same command plus `--force`.
    The screenshots pick the frames to export, and the folders tell frames
    of the same width apart (a tablet design drawn at the desktop width).
    Figma's `Name-1.png` for a second frame called `Name` is matched by
-   size. For frames that clip their content (an overlay that scrolls, a
+   size, and its other renames too: a frame "Account / Favorites" is
+   exported as `Account/Favorites.png` (a folder), "Editor: New" as
+   `Editor_ New.png`. For frames that clip their content (an overlay that scrolls, a
    slider that runs out of the frame), turn off "Clip content" before
    exporting, so the screenshot shows everything; a screenshot larger than
    its frame is matched by name.
@@ -83,6 +85,7 @@ Short flags: `-s` screenshots, `-r` responsive, `-p` project, `-f` frame,
 | `<frame>.html` | one element per visible layer, class names from the layer names; instances carry `data-component`, `data-variant`, `data-props`; text styles that are headings become `h1`–`h6` |
 | `<frame>.css` | one rule per class: auto layout as flexbox (gap, padding, alignment, hug / fill / fixed), everything else absolute; bound variables instead of raw values; `:hover` rules from hover variants with their transition; `@media` rules from the smaller designs |
 | top of both | the **page grid** (side padding of the frame's full-width sections, content width, most common first) and the **designer notes** (text layers taken out of the auto layout, also left in place as `<!-- designer note: … -->`) |
+| textures | layers that are a decorative texture over the page, not content (the same image tiled over the frame width, blended or transparent, like paper noise): a comment in place and a list at the top of the frame files |
 | `<frame>-<width>.*`, `<frame>-tablet.*` | the smaller designs on their own (`-r`), the reliable version |
 | `tokens.css` | the variables the frames use as custom properties (aliases stay aliases), modes as media queries and `[data-<collection>="<mode>"]`, text styles as classes (`.t-h1`); with `-p` the mapping to the project's variables and the tokens without a match |
 | `components.md` | every component across all frames: where it is used, its size per width, the values that differ between uses of the same variant (a bullet orange in one frame and blue in another needs a decision) |
